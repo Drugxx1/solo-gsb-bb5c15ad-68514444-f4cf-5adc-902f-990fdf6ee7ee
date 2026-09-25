@@ -10,6 +10,7 @@
 <div class="readonly-banner">
   🔒 只读分享 · 访谈脚本：<b id="shareName" style="margin:0 6px"></b>
   <span id="inviteBadge" class="invite-chip" style="display:none">🎫 邀请制</span>
+  <span id="langBadge" class="lang-chip" style="display:none"></span>
   <span style="margin-left:auto">此页面为只读快照，无法编辑脚本</span>
 </div>
 <div style="max-width:860px;margin:24px auto;padding:0 16px">
@@ -101,11 +102,22 @@
 <script>
   let runId = null;
   let inviteOnly = false;
+  // Frozen translation snapshot of this share (null = original-only share).
+  // fields["nodeId"] -> {title, text}; fields["nodeId#optionId"] -> {label}.
+  // Only reviewed translations were frozen, so any field absent here falls
+  // back to the original text; option IDs, jumps and recorded answers always
+  // follow the original script.
+  let trFields = null;
+  let shareLang = "";
   const shareToken = new URLSearchParams(location.search).get("token");
   const prefilledResume = (new URLSearchParams(location.search).get("resume") || "").trim();
   const prefilledInvite = (new URLSearchParams(location.search).get("invite") || "").trim();
 
   const $ = (id) => document.getElementById(id);
+
+  // Per-field translation with fallback to the original text.
+  const trNode = (nodeId, field, orig) => trFields?.[nodeId]?.[field] || orig;
+  const trOpt = (nodeId, optId, orig) => trFields?.[`${nodeId}#${optId}`]?.label || orig;
 
   function showGate() { $("gate").style.display = ""; $("session").style.display = "none"; }
   function showSession() { $("gate").style.display = "none"; $("session").style.display = ""; }
@@ -138,22 +150,24 @@
     const node = r.current_node;
     const finished = r.finished || node.terminal || !(node.options || []).length;
     const card = $("previewCard");
+    const title = trNode(node.id, "title", node.title);
+    const text = trNode(node.id, "text", node.text);
     if (finished) {
       card.innerHTML = `
         <div class="q-card">
-          <div class="q-title">${esc(node.title)}</div>
-          <div class="q-text">${esc(node.text)}</div>
+          <div class="q-title">${esc(title)}</div>
+          <div class="q-text">${esc(text)}</div>
           <div class="end">— 访谈结束 —</div>
         </div>`;
     } else {
       card.innerHTML = `
         <div class="q-card">
-          <div class="q-title">${esc(node.title)}</div>
-          <div class="q-text">${esc(node.text)}</div>
+          <div class="q-title">${esc(title)}</div>
+          <div class="q-text">${esc(text)}</div>
           <div class="choices">
             ${node.options.map((o) =>
               `<button data-oid="${o.id}" ${o.target_id ? "" : "disabled"}>
-                 ${esc(o.label)}${o.target_id ? "" : "（未连接）"}
+                 ${esc(trOpt(node.id, o.id, o.label))}${o.target_id ? "" : "（未连接）"}
                </button>`).join("")}
           </div>
         </div>`;
@@ -313,6 +327,12 @@
       $("shareName").textContent = share.name;
       inviteOnly = !!share.invite_only;
       $("inviteBadge").style.display = inviteOnly ? "" : "none";
+      shareLang = share.lang || "";
+      trFields = share.translations?.fields || null;
+      if (shareLang && trFields) {
+        $("langBadge").textContent = `🌐 译文 · ${shareLang}`;
+        $("langBadge").style.display = "";
+      }
       renderGate();
       showGate();
       if (inviteOnly && prefilledInvite) {

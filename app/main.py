@@ -16,6 +16,8 @@ from .graph import plan_route
 from .graph import replay_run
 from .graph import step as graph_step
 from .graph import validate as validate_content
+from .translations import ALL_FIELDS, NODE_FIELDS, OPTION_FIELD
+from .translations import freeze_snapshot, sync_translations, translation_stats
 
 app = FastAPI(title="分支访谈脚本编辑器", version="1.0.0")
 
@@ -92,6 +94,23 @@ class ImpactIn(BaseModel):
     content: ContentIn
 
 
+class TranslationItem(BaseModel):
+    node_id: str
+    option_id: str = ""               # '' = node-level field (title/text)
+    field: str                        # 'title' | 'text' | 'label'
+    text: str = ""
+    source_text: str = ""             # original text this translation matches
+
+
+class TranslationsUpdate(BaseModel):
+    target_lang: str | None = None    # set/replace the script's target language
+    items: list[TranslationItem] = Field(default_factory=list)
+
+
+class ShareCreate(BaseModel):
+    lang: str | None = None           # freeze this language's translations
+
+
 # ---- lifecycle ------------------------------------------------------------
 
 @app.on_event("startup")
@@ -120,7 +139,7 @@ def create_script(payload: ScriptIn):
             (payload.name, json.dumps(content, ensure_ascii=False), ts, ts),
         )
         sid = cur.lastrowid
-    return {"id": sid, "name": payload.name, "content": content,
+    return {"id": sid, "name": payload.name, "content": content, "target_lang": "",
             "created_at": ts, "updated_at": ts}
 
 
@@ -130,6 +149,7 @@ def _fetch_script(script_id: int) -> dict[str, Any]:
     if row is None:
         raise HTTPException(404, "脚本不存在")
     return {"id": row["id"], "name": row["name"], "content": json.loads(row["content"]),
+            "target_lang": row["target_lang"] or "",
             "created_at": row["created_at"], "updated_at": row["updated_at"]}
 
 
@@ -149,6 +169,11 @@ def update_script(script_id: int, payload: ScriptUpdate):
             "UPDATE scripts SET name = ?, content = ?, updated_at = ? WHERE id = ?",
             (name, json.dumps(content, ensure_ascii=False), ts, script_id),
         )
+        # The saved original text is the source of truth for translation
+        # review: flag translations whose original drifted (待复核) and drop
+        # translations of deleted nodes/options so they can never attach to
+        # new objects.
+        sync_translations(db, script_id, existing["target_lang"], content, ts)
     return {"id": script_id, "name": name, "content": content, "updated_at": ts}
 
 
@@ -157,6 +182,7 @@ def delete_script(script_id: int):
     _fetch_script(script_id)
     with get_db() as db:
         db.execute("DELETE FROM scripts WHERE id = ?", (script_id,))
+        db.execute("DELETE FROM translations WHERE script_id = ?", (script_id,))
 
 
 # ---- validation -----------------------------------------------------------
@@ -166,6 +192,92 @@ def validate_saved_script(script_id: int):
     script = _fetch_script(script_id)
     result = validate_content(script["content"])
     return result
+
+
+# ---- multilingual translations --------------------------------------------
+
+def _translation_rows(db, script_id: int, lang: str) -> list[dict[str, Any]]:
+    rows = db.execute(
+        "SELECT node_id, option_id, field, text, source_text, stale, updated_at "
+        "FROM translations WHERE script_id = ? AND lang = ? "
+        "ORDER BY node_id, option_id, field",
+        (script_id, lang),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+@app.get("/api/scripts/{script_id}/translations")
+def get_translations(script_id: int):
+    """The script's target language plus every stored translation row.
+
+    Rows are keyed by node/option ID. ``stale`` reflects the last save; the
+    editor additionally re-checks each row's ``source_text`` against the live
+    canvas so unsaved original edits show as 待复核 immediately. ``stats``
+    counts ok/stale/missing fields of the *saved* script — the same numbers
+    the share dialog shows before freezing a translated snapshot.
+    """
+    script = _fetch_script(script_id)
+    lang = script["target_lang"]
+    with get_db() as db:
+        items = _translation_rows(db, script_id, lang) if lang else []
+        stats = (translation_stats(db, script_id, lang, script["content"])
+                 if lang else {"ok": 0, "stale": 0, "missing": 0, "total": 0})
+    return {"script_id": script_id, "target_lang": lang,
+            "items": items, "stats": stats}
+
+
+@app.put("/api/scripts/{script_id}/translations")
+def put_translations(script_id: int, payload: TranslationsUpdate):
+    """Set the target language and/or upsert per-field translations.
+
+    Each item carries the ``source_text`` it was translated against (the
+    editor's current canvas text), so a saved/confirmed translation starts
+    un-stale; the next script save re-derives the flag from the saved
+    original. An item with blank text deletes that translation (back to
+    缺失). Existence is intentionally not enforced: the editor may
+    legitimately translate not-yet-saved canvas objects, and the next
+    script save prunes rows whose node/option vanished.
+    """
+    script = _fetch_script(script_id)
+    ts = now_iso()
+    with get_db() as db:
+        if payload.target_lang is not None:
+            lang = payload.target_lang.strip()
+            db.execute("UPDATE scripts SET target_lang = ? WHERE id = ?",
+                       (lang, script_id))
+        else:
+            lang = script["target_lang"]
+        if payload.items and not lang:
+            raise HTTPException(400, "请先为脚本设置目标语言，再保存译文")
+        for item in payload.items:
+            field = item.field
+            if field not in ALL_FIELDS:
+                raise HTTPException(400, f"不支持的字段类型: {field}")
+            if field in NODE_FIELDS and item.option_id:
+                raise HTTPException(400, "节点字段不应携带 option_id")
+            if field == OPTION_FIELD and not item.option_id:
+                raise HTTPException(400, "选项文案译文缺少 option_id")
+            key = (script_id, lang, item.node_id, item.option_id or "", field)
+            if not (item.text or "").strip():
+                db.execute(
+                    "DELETE FROM translations WHERE script_id = ? AND lang = ? "
+                    "AND node_id = ? AND option_id = ? AND field = ?", key)
+                continue
+            db.execute(
+                "INSERT INTO translations (script_id, lang, node_id, option_id, "
+                "field, text, source_text, stale, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?) "
+                "ON CONFLICT (script_id, lang, node_id, option_id, field) "
+                "DO UPDATE SET text = excluded.text, "
+                "source_text = excluded.source_text, stale = 0, "
+                "updated_at = excluded.updated_at",
+                (*key, item.text, item.source_text or "", ts),
+            )
+        items = _translation_rows(db, script_id, lang) if lang else []
+        stats = (translation_stats(db, script_id, lang, script["content"])
+                 if lang else {"ok": 0, "stale": 0, "missing": 0, "total": 0})
+    return {"script_id": script_id, "target_lang": lang,
+            "items": items, "stats": stats}
 
 
 # ---- branch coverage ------------------------------------------------------
@@ -410,18 +522,40 @@ def import_script(payload: dict[str, Any]):
 # ---- read-only sharing ----------------------------------------------------
 
 @app.post("/api/scripts/{script_id}/share")
-def create_share(script_id: int):
+def create_share(script_id: int, payload: ShareCreate | None = None):
+    """Snapshot the saved script into a read-only share link.
+
+    When ``lang`` is given it must match the script's configured target
+    language; the translations usable at this moment (reviewed, non-stale,
+    still matching the saved original) are frozen into the snapshot. The
+    answer page then shows those translations field by field and falls back
+    to the original text for missing or pending-review fields. Option IDs,
+    jumps and answer records always follow the original script content.
+    """
     script = _fetch_script(script_id)
+    lang = ((payload.lang if payload else None) or "").strip()
+    target_lang = script["target_lang"]
+    if lang:
+        if not target_lang:
+            raise HTTPException(400, "该脚本尚未设置目标语言，无法创建译文分享")
+        if lang != target_lang:
+            raise HTTPException(400, "选择的语言与脚本配置的目标语言不一致")
     token = secrets.token_urlsafe(8)
     ts = now_iso()
     with get_db() as db:
+        frozen = (freeze_snapshot(db, script_id, lang, script["content"])
+                  if lang else None)
         db.execute(
-            "INSERT INTO shares (token, script_id, script_name, content, invite_only, created_at) "
-            "VALUES (?, ?, ?, ?, 0, ?)",
+            "INSERT INTO shares (token, script_id, script_name, content, "
+            "invite_only, lang, translations, created_at) "
+            "VALUES (?, ?, ?, ?, 0, ?, ?, ?)",
             (token, script_id, script["name"],
-             json.dumps(script["content"], ensure_ascii=False), ts),
+             json.dumps(script["content"], ensure_ascii=False),
+             lang, json.dumps(frozen, ensure_ascii=False) if frozen else "", ts),
         )
-    return {"token": token, "url": f"/share.html?token={token}", "invite_only": False}
+    return {"token": token, "url": f"/share.html?token={token}",
+            "invite_only": False, "lang": lang,
+            "frozen_fields": sum(len(v) for v in frozen["fields"].values()) if frozen else 0}
 
 
 @app.get("/api/share/{token}")
@@ -430,9 +564,11 @@ def get_share(token: str):
         row = db.execute("SELECT * FROM shares WHERE token = ?", (token,)).fetchone()
     if row is None:
         raise HTTPException(404, "分享链接不存在或已失效")
+    frozen = json.loads(row["translations"]) if row["translations"] else None
     return {"token": row["token"], "name": row["script_name"],
             "content": json.loads(row["content"]), "created_at": row["created_at"],
             "invite_only": bool(row["invite_only"]),
+            "lang": row["lang"] or "", "translations": frozen,
             "read_only": True}
 
 

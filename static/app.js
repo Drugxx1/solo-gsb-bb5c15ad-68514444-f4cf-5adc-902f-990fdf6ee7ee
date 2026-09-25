@@ -18,6 +18,8 @@ const state = {
   history: { stack: [], index: -1, mergeKey: null, mergeAt: 0 },
   savedSnapshot: null,        // JSON of {name, content} at last save / open
   coverage: null,             // branch coverage stats for the saved script, null = unknown
+  translations: null,         // {target_lang, items, stats} from the server, null = unknown
+  trMap: new Map(),           // "nodeId::optionId::field" -> translation row
 };
 
 const HISTORY_LIMIT = 100;
@@ -545,6 +547,274 @@ function renderRouteResult() {
   });
 }
 
+// ---------------------------------------------------------------- translations
+// 多语言译文: the script keeps ONE target language (scripts.target_lang);
+// translations are stored server-side keyed by node/option ID + field, each
+// remembering the original text it was translated against. The live status of
+// every field is computed against the CURRENT canvas (unsaved edits included):
+//   ok      — translation exists and its source snapshot matches the original
+//   stale   — the original changed since (待复核)
+//   missing — no translation yet
+// Deleting a node/option can never leak its translation onto a new object:
+// lookups are by ID and new objects get fresh IDs; the server prunes rows for
+// vanished objects on every save.
+
+const i18nState = { filter: "all", fieldIndex: new Map() };
+
+const TR_STATUS_META = {
+  ok: { label: "已复核", cls: "ok" },
+  stale: { label: "待复核", cls: "stale" },
+  missing: { label: "缺失", cls: "missing" },
+};
+
+const trKey = (nodeId, optionId, field) => `${nodeId}::${optionId || ""}::${field}`;
+
+async function loadTranslations() {
+  if (!state.currentId) {
+    state.translations = null; state.trMap = new Map(); return null;
+  }
+  try {
+    const r = await api(`/api/scripts/${state.currentId}/translations`);
+    state.translations = r;
+    state.trMap = new Map((r.items || []).map((it) => [trKey(it.node_id, it.option_id, it.field), it]));
+  } catch (err) {
+    state.translations = null; state.trMap = new Map();
+  }
+  return state.translations;
+}
+
+// Original text of one translatable field on the current canvas (null = gone).
+function trSourceOf(nodeId, optionId, field) {
+  const n = getNode(nodeId);
+  if (!n) return null;
+  if (field === "label") {
+    const o = (n.options || []).find((x) => x.id === optionId);
+    return o ? (o.label ?? "") : null;
+  }
+  return n[field] ?? "";
+}
+
+function trStatusOf(nodeId, optionId, field) {
+  const t = state.trMap.get(trKey(nodeId, optionId, field));
+  if (!t || !t.text) return "missing";
+  const src = trSourceOf(nodeId, optionId, field);
+  if (src === null) return "missing";
+  return (t.source_text ?? "") === src ? "ok" : "stale";
+}
+
+// Every translatable field of the current canvas, in canvas order.
+function trFields() {
+  const out = [];
+  (state.doc?.content.nodes || []).forEach((n) => {
+    out.push({ node: n, optionId: "", field: "title", label: "标题", src: n.title ?? "" });
+    out.push({ node: n, optionId: "", field: "text", label: "正文", src: n.text ?? "" });
+    (n.options || []).forEach((o) => {
+      out.push({ node: n, optionId: o.id, field: "label",
+                 label: `选项「${o.label || "(未命名选项)"}」`, src: o.label ?? "" });
+    });
+  });
+  return out;
+}
+
+function trStats() {
+  const s = { ok: 0, stale: 0, missing: 0, total: 0 };
+  trFields().forEach((f) => {
+    s[trStatusOf(f.node.id, f.optionId, f.field)] += 1;
+    s.total += 1;
+  });
+  return s;
+}
+
+async function openI18n() {
+  if (!state.currentId || !state.doc) return;
+  openModal("i18nModal");
+  $("#trList").innerHTML = `<div class="cov-empty">正在加载译文…</div>`;
+  await loadTranslations();
+  renderI18nModal();
+  renderStatus();
+}
+
+function renderI18nModal() {
+  const lang = state.translations?.target_lang || "";
+  $("#trLang").value = lang;
+  $("#trLangHint").textContent = lang ? `当前目标语言：${lang}` : "尚未设置目标语言";
+  $("#trNoLang").style.display = lang ? "none" : "";
+  $("#trMain").style.display = lang ? "" : "none";
+  if (!lang) return;
+  renderTrSummary();
+  renderTrIssues();
+  renderTrList();
+}
+
+function renderTrSummary() {
+  const s = trStats();
+  $("#trSummary").innerHTML = `
+    <div><b>${s.total}</b><span>可翻译字段</span></div>
+    <div class="tr-num-ok"><b>${s.ok}</b><span>已复核</span></div>
+    <div class="tr-num-stale"><b>${s.stale}</b><span>待复核</span></div>
+    <div class="tr-num-miss"><b>${s.missing}</b><span>缺失</span></div>`;
+}
+
+// Clickable list of every non-ok field: click a chip to locate that field.
+function renderTrIssues() {
+  const el = $("#trIssues");
+  const issues = trFields()
+    .map((f) => ({ ...f, status: trStatusOf(f.node.id, f.optionId, f.field) }))
+    .filter((f) => f.status !== "ok");
+  if (!issues.length) {
+    el.innerHTML = `<div class="tr-all-ok">✓ 全部字段译文均已复核，可用于译文分享。</div>`;
+    return;
+  }
+  const stale = issues.filter((f) => f.status === "stale").length;
+  const missing = issues.length - stale;
+  el.innerHTML =
+    `<div class="tr-issues-head">待处理 <b>${issues.length}</b> 个字段（待复核 ${stale} · 缺失 ${missing}），点击可定位到对应字段：</div>` +
+    issues.map((f) => {
+      const key = trKey(f.node.id, f.optionId, f.field);
+      return `<button class="tr-issue-chip ${f.status}" data-trjump="${esc(key)}"
+          title="定位到该字段">${esc(f.node.title || "(未命名节点)")} · ${esc(f.label)}</button>`;
+    }).join("");
+  el.querySelectorAll("[data-trjump]").forEach((b) => {
+    b.onclick = () => locateTrField(b.dataset.trjump);
+  });
+}
+
+function renderTrField(f) {
+  const status = trStatusOf(f.node.id, f.optionId, f.field);
+  if (i18nState.filter !== "all" && status !== i18nState.filter) return "";
+  const key = trKey(f.node.id, f.optionId, f.field);
+  i18nState.fieldIndex.set(key, f);
+  const t = state.trMap.get(key);
+  const meta = TR_STATUS_META[status];
+  const input = f.field === "text"
+    ? `<textarea class="tr-input" data-trinput="${esc(key)}" placeholder="填写译文">${esc(t?.text || "")}</textarea>`
+    : `<input type="text" class="tr-input" data-trinput="${esc(key)}"
+         value="${esc(t?.text || "")}" placeholder="填写译文">`;
+  return `
+    <div class="tr-field ${status}" data-tr-field="${esc(key)}">
+      <div class="tr-field-head">
+        <span class="tr-field-name">${esc(f.label)}</span>
+        <span class="tr-badge ${meta.cls}">${meta.label}</span>
+      </div>
+      <div class="tr-src" title="当前原文">${esc(f.src || "（原文为空）")}</div>
+      ${input}
+      <button class="tr-keep" data-trkeep="${esc(key)}"
+              style="${status === "stale" ? "" : "display:none"}">✓ 译文仍适用，标记为已复核</button>
+    </div>`;
+}
+
+function renderTrList() {
+  const el = $("#trList");
+  const nodes = state.doc?.content.nodes || [];
+  i18nState.fieldIndex = new Map();
+  if (!nodes.length) {
+    el.innerHTML = `<div class="cov-empty">当前脚本还没有节点，先在画布上添加问题节点。</div>`;
+    return;
+  }
+  const html = nodes.map((n) => {
+    const fields = [
+      { node: n, optionId: "", field: "title", label: "标题", src: n.title ?? "" },
+      { node: n, optionId: "", field: "text", label: "正文", src: n.text ?? "" },
+      ...(n.options || []).map((o) => ({
+        node: n, optionId: o.id, field: "label",
+        label: `选项「${o.label || "(未命名选项)"}」`, src: o.label ?? "",
+      })),
+    ];
+    const body = fields.map(renderTrField).join("");
+    if (!body) return "";   // nothing visible under the current filter
+    return `
+      <div class="tr-node">
+        <div class="tr-node-head">
+          <b>${esc(n.title || "(未命名节点)")}</b>
+          <span class="tr-node-id">${esc(n.id)}${n.id === state.doc.content.start_node_id ? " · 起始" : ""}${n.terminal ? " · 终点" : ""}</span>
+          <button class="tr-locate" data-trlocate="${esc(n.id)}" title="在画布上定位该节点">🎯 定位节点</button>
+        </div>
+        ${body}
+      </div>`;
+  }).join("");
+  el.innerHTML = html || `<div class="cov-empty">当前筛选下没有字段。</div>`;
+  el.querySelectorAll("[data-trinput]").forEach((inp) => {
+    inp.onchange = () => saveTrField(inp.dataset.trinput, inp.value);
+  });
+  el.querySelectorAll("[data-trkeep]").forEach((b) => {
+    b.onclick = () => keepTrField(b.dataset.trkeep);
+  });
+  el.querySelectorAll("[data-trlocate]").forEach((b) => {
+    b.onclick = () => locateNodeOnCanvas(b.dataset.trlocate);
+  });
+}
+
+// Re-render list + summary while keeping the modal scroll position.
+function rerenderTrKeepScroll() {
+  const body = $("#i18nModal .body");
+  const top = body ? body.scrollTop : 0;
+  renderTrSummary();
+  renderTrIssues();
+  renderTrList();
+  if (body) body.scrollTop = top;
+  renderStatus();
+}
+
+async function saveTrField(key, text) {
+  const f = i18nState.fieldIndex.get(key);
+  if (!f || !state.currentId) return;
+  const src = trSourceOf(f.node.id, f.optionId, f.field) ?? "";
+  try {
+    const r = await api(`/api/scripts/${state.currentId}/translations`, {
+      method: "PUT",
+      body: { items: [{ node_id: f.node.id, option_id: f.optionId || "",
+                        field: f.field, text, source_text: src }] },
+    });
+    state.translations = r;
+    state.trMap = new Map((r.items || []).map((it) => [trKey(it.node_id, it.option_id, it.field), it]));
+    toast(text.trim() ? "译文已保存" : "已清除该字段译文");
+  } catch (err) {
+    toast("译文保存失败：" + err.message, 3500);
+  }
+  rerenderTrKeepScroll();
+}
+
+// The original changed but the existing translation is still fine: re-affirm
+// it against the current original text, clearing the 待复核 flag.
+async function keepTrField(key) {
+  const t = state.trMap.get(key);
+  if (!t || !t.text) return;
+  await saveTrField(key, t.text);
+}
+
+async function saveTrLang() {
+  if (!state.currentId) return;
+  const lang = $("#trLang").value.trim();
+  try {
+    const r = await api(`/api/scripts/${state.currentId}/translations`, {
+      method: "PUT", body: { target_lang: lang },
+    });
+    state.translations = r;
+    state.trMap = new Map((r.items || []).map((it) => [trKey(it.node_id, it.option_id, it.field), it]));
+    toast(lang ? `目标语言已设置为「${lang}」` : "已清除目标语言");
+  } catch (err) {
+    toast("保存目标语言失败：" + err.message, 3500);
+  }
+  renderI18nModal();
+  renderStatus();
+}
+
+// Scroll to and highlight one translation field inside the modal.
+function locateTrField(key) {
+  if (i18nState.filter !== "all") {
+    i18nState.filter = "all";
+    document.querySelectorAll("#trFilter button").forEach((b) =>
+      b.classList.toggle("on", b.dataset.trf === "all"));
+    renderTrList();
+  }
+  const row = document.querySelector(`[data-tr-field="${CSS.escape(key)}"]`);
+  if (!row) return;
+  row.scrollIntoView({ block: "center", behavior: "smooth" });
+  row.classList.add("tr-flash");
+  setTimeout(() => row.classList.remove("tr-flash"), 1600);
+  row.querySelector(".tr-input")?.focus({ preventScroll: true });
+}
+
 // Center the node in the viewport and select it (canvas + inspector).
 function locateNodeOnCanvas(id) {
   const n = getNode(id);
@@ -568,13 +838,25 @@ function renderStatus() {
   const m = state.markers;
   const label = (arr, cls, text) =>
     arr.length ? `<span class="badge ${cls}"><span class="dot ${cls}"></span>${text} ${arr.length}</span>` : "";
+  let trBadge = "";
+  if (state.doc && state.translations?.target_lang) {
+    const s = trStats();
+    trBadge = (s.stale || s.missing)
+      ? `<span class="badge tr-warn-badge" id="trStatusBadge"
+           title="译文有缺失或待复核字段，点击打开译文管理定位">🌐 译文待复核 ${s.stale} · 缺失 ${s.missing}</span>`
+      : `<span class="badge ok" id="trStatusBadge"
+           title="全部字段译文均已复核，点击打开译文管理">🌐 译文 ${s.ok}/${s.total} 已复核</span>`;
+  }
   el.innerHTML =
     (state.dirty ? `<span class="badge dirty">未保存</span>` : `<span class="badge ok">已保存</span>`) +
     label(m.cycles, "cycle", "环路") +
     label(m.orphans, "orphan", "孤立") +
     label(m.uncovered, "uncovered", "未覆盖出口") +
     (!m.cycles.length && !m.orphans.length && !m.uncovered.length
-      ? `<span class="badge ok">流程校验通过</span>` : "");
+      ? `<span class="badge ok">流程校验通过</span>` : "") +
+    trBadge;
+  const trb = $("#trStatusBadge");
+  if (trb) trb.onclick = openI18n;
 }
 
 function renderAll() {
@@ -949,6 +1231,8 @@ async function loadList(selectId) {
     state.doc = null;
     state.dirty = false;
     state.coverage = null;
+    state.translations = null;
+    state.trMap = new Map();
     state.markers = { cycles: [], orphans: [], uncovered: [], errors: [] };
     resetHistory();
     renderStatus();
@@ -965,6 +1249,7 @@ async function openScript(id) {
   $("#scriptName").value = s.name;
   state.pan = { x: 60, y: 40 };
   await loadCoverage();
+  await loadTranslations();
   validateLocal();
   renderAll();
   resetHistory();
@@ -1007,6 +1292,7 @@ async function saveScript() {
   if (fresh) { state.markers = fresh; }
   state.scripts = await api("/api/scripts");
   await loadCoverage();
+  await loadTranslations();   // save re-derived stale flags / pruned rows server-side
   validateLocal();
   renderAll();
   // saved: unsaved marker clears and undo/redo history restarts from this point
@@ -1026,7 +1312,28 @@ function bindToolbar() {
   $("#impactRefresh").onclick = runImpact;
   $("#btnRoute").onclick = openRoute;
   $("#routeRun").onclick = runRoutePlan;
+  $("#btnI18n").onclick = openI18n;
+  $("#trLangSave").onclick = saveTrLang;
+  $("#trFilter").addEventListener("click", (e) => {
+    const b = e.target.closest("[data-trf]");
+    if (!b) return;
+    i18nState.filter = b.dataset.trf;
+    document.querySelectorAll("#trFilter button").forEach((x) =>
+      x.classList.toggle("on", x === b));
+    renderTrList();
+  });
   $("#btnShare").onclick = openShare;
+  $("#shareGenerate").onclick = generateShare;
+  $("#shareCopy").onclick = () => {
+    if (!shareState.url) return;
+    copyText(shareState.url).then((ok) => toast(ok ? "链接已复制" : "复制失败，请手动选择复制"));
+  };
+  $("#shareOpen").onclick = () => {
+    if (shareState.url) window.open(shareState.url, "_blank");
+  };
+  document.querySelectorAll('input[name="shareLang"]').forEach((r) => {
+    r.onchange = updateShareLangStats;
+  });
   $("#inviteGen").onclick = generateInvites;
   $("#inviteRefresh").onclick = loadInvites;
   $("#btnExport").onclick = exportJson;
@@ -1059,7 +1366,10 @@ function bindToolbar() {
       const id = Number(del.dataset.del);
       if (!confirm("确认删除该脚本？")) return;
       await api(`/api/scripts/${id}`, { method: "DELETE" });
-      if (state.currentId === id) { state.currentId = null; state.doc = null; state.coverage = null; }
+      if (state.currentId === id) {
+        state.currentId = null; state.doc = null; state.coverage = null;
+        state.translations = null; state.trMap = new Map();
+      }
       await loadList();
       return;
     }
@@ -1324,16 +1634,70 @@ const shareState = { token: null, url: "" };
 async function openShare() {
   if (!state.currentId) return;
   if (state.dirty) await saveScript();
-  const r = await api(`/api/scripts/${state.currentId}/share`, { method: "POST" });
-  shareState.token = r.token;
-  shareState.url = location.origin + r.url;
-  $("#shareLink").value = shareState.url;
-  $("#shareOpen").onclick = () => window.open(shareState.url, "_blank");
-  $("#shareCopy").onclick = () => {
-    copyText(shareState.url).then((ok) => toast(ok ? "链接已复制" : "复制失败，请手动选择复制"));
-  };
+  await loadTranslations();   // fresh counts for the language choice below
+  shareState.token = null;
+  shareState.url = "";
+  $("#shareResult").style.display = "none";
+  $("#shareLink").value = "";
+  $("#shareResultNote").innerHTML = "";
+  const lang = state.translations?.target_lang || "";
+  const box = $("#shareLangBox");
+  // always reset to the original-language choice for a fresh snapshot
+  document.querySelector('input[name="shareLang"][value=""]').checked = true;
+  if (lang) {
+    box.style.display = "";
+    $("#shareLangName").textContent = lang;
+    $("#shareLangTr").value = lang;
+    updateShareLangStats();
+  } else {
+    box.style.display = "none";
+    $("#shareLangStats").style.display = "none";
+  }
   openModal("shareModal");
-  loadInvites();
+}
+
+function shareLangChoice() {
+  return document.querySelector('input[name="shareLang"]:checked')?.value || "";
+}
+
+// Preview of what a translated snapshot would freeze right now.
+function updateShareLangStats() {
+  const el = $("#shareLangStats");
+  const lang = state.translations?.target_lang || "";
+  if (!lang || !shareLangChoice()) {
+    el.style.display = "none"; el.innerHTML = ""; return;
+  }
+  const s = trStats();
+  el.style.display = "";
+  el.innerHTML =
+    `将把当前 <b>${s.ok}</b> 个已复核译文字段冻结进快照` +
+    ((s.stale || s.missing)
+      ? `；<b class="tr-warn">${s.stale} 个待复核、${s.missing} 个缺失</b>字段将在作答页回退为原文`
+      : "，全部字段均已覆盖 ✓") +
+    `。<br>快照生成后再改译文不影响该分享；选项 ID、跳转与作答记录始终沿用原脚本。`;
+}
+
+async function generateShare() {
+  if (!state.currentId) return;
+  const lang = shareLangChoice();
+  const btn = $("#shareGenerate");
+  btn.disabled = true;
+  try {
+    const r = await api(`/api/scripts/${state.currentId}/share`, {
+      method: "POST", body: { lang: lang || undefined },
+    });
+    shareState.token = r.token;
+    shareState.url = location.origin + r.url;
+    $("#shareLink").value = shareState.url;
+    $("#shareResultNote").innerHTML = r.lang
+      ? `🌐 译文分享（<b>${esc(r.lang)}</b>）：已冻结 <b>${r.frozen_fields}</b> 个已复核译文字段；缺失或待复核字段在作答页回退原文。`
+      : "原文分享：未附带译文。";
+    $("#shareResult").style.display = "";
+    loadInvites();
+  } catch (err) {
+    toast("生成分享失败：" + err.message, 3500);
+  }
+  btn.disabled = false;
 }
 
 async function loadInvites() {

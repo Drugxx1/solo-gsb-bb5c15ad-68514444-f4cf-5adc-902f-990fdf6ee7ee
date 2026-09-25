@@ -74,6 +74,30 @@ def init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_invite_codes_share
                 ON invite_codes(share_token);
+
+            -- Per-field translations of a script into ONE target language
+            -- (scripts.target_lang). Keyed by node/option ID, never by
+            -- position, so a deleted node/option can never pass its
+            -- translation on to a newly created object (fresh IDs).
+            -- option_id '' = node-level field (title/text); otherwise the
+            -- row translates that option's label.
+            -- source_text snapshots the original text the translation was
+            -- last edited/confirmed against; when the original drifts away
+            -- from it the row is flagged stale (待复核).
+            CREATE TABLE IF NOT EXISTS translations (
+                script_id   INTEGER NOT NULL,
+                lang        TEXT NOT NULL,
+                node_id     TEXT NOT NULL,
+                option_id   TEXT NOT NULL DEFAULT '',
+                field       TEXT NOT NULL,        -- 'title' | 'text' | 'label'
+                text        TEXT NOT NULL DEFAULT '',
+                source_text TEXT NOT NULL DEFAULT '',
+                stale       INTEGER NOT NULL DEFAULT 0,  -- 1 = 待复核
+                updated_at  TEXT NOT NULL,
+                PRIMARY KEY (script_id, lang, node_id, option_id, field)
+            );
+            CREATE INDEX IF NOT EXISTS idx_translations_script
+                ON translations(script_id, lang);
             """
         )
         # Backfill old databases created before invite codes existed.
@@ -81,4 +105,18 @@ def init_db() -> None:
         if "invite_only" not in cols:
             db.execute(
                 "ALTER TABLE shares ADD COLUMN invite_only INTEGER NOT NULL DEFAULT 0"
+            )
+        # Backfill columns introduced with the multilingual share module.
+        if "lang" not in cols:
+            db.execute(
+                "ALTER TABLE shares ADD COLUMN lang TEXT NOT NULL DEFAULT ''"
+            )
+        if "translations" not in cols:
+            db.execute(
+                "ALTER TABLE shares ADD COLUMN translations TEXT NOT NULL DEFAULT ''"
+            )
+        script_cols = {r["name"] for r in db.execute("PRAGMA table_info(scripts)").fetchall()}
+        if "target_lang" not in script_cols:
+            db.execute(
+                "ALTER TABLE scripts ADD COLUMN target_lang TEXT NOT NULL DEFAULT ''"
             )
