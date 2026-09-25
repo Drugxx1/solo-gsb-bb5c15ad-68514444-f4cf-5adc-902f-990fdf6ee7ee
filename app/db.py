@@ -74,11 +74,51 @@ def init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_invite_codes_share
                 ON invite_codes(share_token);
+
+            -- Multilingual translations for ONE target language per script.
+            -- Every row is bound to a concrete node/option by its ids (never
+            -- by position): when a node/option is deleted the matching rows
+            -- are removed when the script is saved, so an old translation can
+            -- never attach to a newly created object even if an id recurs.
+            -- source_hash pins the original text the translation was written
+            -- against; status derives from it: 'reviewed' while the current
+            -- source hashes equal, 'pending' (待复核) once the source changes.
+            CREATE TABLE IF NOT EXISTS translations (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                script_id   INTEGER NOT NULL,
+                lang_code   TEXT NOT NULL,
+                node_id     TEXT NOT NULL,
+                field       TEXT NOT NULL,   -- 'title' | 'text' | 'option_label'
+                option_id   TEXT,            -- non-null only for option_label
+                translation TEXT NOT NULL DEFAULT '',
+                source_hash TEXT NOT NULL DEFAULT '',
+                status      TEXT NOT NULL DEFAULT 'reviewed',
+                updated_at  TEXT NOT NULL
+            );
+            -- SQLite treats NULLs as distinct in a plain UNIQUE index, so the
+            -- node fields and the option fields need separate partial indexes.
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_translations_node
+                ON translations (script_id, lang_code, node_id, field)
+                WHERE option_id IS NULL;
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_translations_option
+                ON translations (script_id, lang_code, node_id, field, option_id)
+                WHERE option_id IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_translations_script
+                ON translations (script_id);
             """
         )
-        # Backfill old databases created before invite codes existed.
-        cols = {r["name"] for r in db.execute("PRAGMA table_info(shares)").fetchall()}
-        if "invite_only" not in cols:
-            db.execute(
-                "ALTER TABLE shares ADD COLUMN invite_only INTEGER NOT NULL DEFAULT 0"
-            )
+        # Backfill old databases created before these features existed.
+        backfills = [
+            ("shares", "invite_only",
+             "ALTER TABLE shares ADD COLUMN invite_only INTEGER NOT NULL DEFAULT 0"),
+            ("scripts", "lang_code", "ALTER TABLE scripts ADD COLUMN lang_code TEXT"),
+            ("scripts", "lang_label", "ALTER TABLE scripts ADD COLUMN lang_label TEXT"),
+            ("shares", "lang_code", "ALTER TABLE shares ADD COLUMN lang_code TEXT"),
+            ("shares", "lang_label", "ALTER TABLE shares ADD COLUMN lang_label TEXT"),
+            ("shares", "translations",
+             "ALTER TABLE shares ADD COLUMN translations TEXT NOT NULL DEFAULT '{}'"),
+        ]
+        for table, column, ddl in backfills:
+            cols = {r["name"] for r in db.execute(f"PRAGMA table_info({table})").fetchall()}
+            if column not in cols:
+                db.execute(ddl)

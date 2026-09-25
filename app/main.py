@@ -16,6 +16,12 @@ from .graph import plan_route
 from .graph import replay_run
 from .graph import step as graph_step
 from .graph import validate as validate_content
+from .i18n import VALID_FIELDS
+from .i18n import freeze_translations
+from .i18n import get_field_source
+from .i18n import hash_source
+from .i18n import reconcile_translations
+from .i18n import translation_view
 
 app = FastAPI(title="分支访谈脚本编辑器", version="1.0.0")
 
@@ -58,6 +64,24 @@ class ScriptIn(BaseModel):
 class ScriptUpdate(BaseModel):
     name: str | None = None
     content: ContentIn | None = None
+
+
+class ShareCreate(BaseModel):
+    # Optional: when set, the snapshot freezes this language's reviewed
+    # translations. Must match the script's configured target language.
+    lang_code: str | None = None
+
+
+class LanguageIn(BaseModel):
+    lang_code: str = Field(min_length=1, max_length=20)
+    lang_label: str = Field(min_length=1, max_length=80)
+
+
+class TranslationIn(BaseModel):
+    node_id: str = Field(min_length=1, max_length=100)
+    field: str
+    option_id: str | None = None
+    translation: str = Field(default="", max_length=10000)
 
 
 class RunStart(BaseModel):
@@ -130,6 +154,7 @@ def _fetch_script(script_id: int) -> dict[str, Any]:
     if row is None:
         raise HTTPException(404, "脚本不存在")
     return {"id": row["id"], "name": row["name"], "content": json.loads(row["content"]),
+            "lang_code": row["lang_code"], "lang_label": row["lang_label"],
             "created_at": row["created_at"], "updated_at": row["updated_at"]}
 
 
@@ -149,7 +174,14 @@ def update_script(script_id: int, payload: ScriptUpdate):
             "UPDATE scripts SET name = ?, content = ?, updated_at = ? WHERE id = ?",
             (name, json.dumps(content, ensure_ascii=False), ts, script_id),
         )
-    return {"id": script_id, "name": name, "content": content, "updated_at": ts}
+        # Reconcile translations in the SAME transaction as the save:
+        # rows of deleted nodes/options are removed, surviving rows whose
+        # source changed flip to 待复核 (pending). A later edit restoring the
+        # original text flips them back to reviewed automatically.
+        reconcile_translations(db, script_id, content)
+    return {"id": script_id, "name": name, "content": content,
+            "lang_code": existing["lang_code"], "lang_label": existing["lang_label"],
+            "updated_at": ts}
 
 
 @app.delete("/api/scripts/{script_id}", status_code=204)
@@ -157,6 +189,7 @@ def delete_script(script_id: int):
     _fetch_script(script_id)
     with get_db() as db:
         db.execute("DELETE FROM scripts WHERE id = ?", (script_id,))
+        db.execute("DELETE FROM translations WHERE script_id = ?", (script_id,))
 
 
 # ---- validation -----------------------------------------------------------
@@ -166,6 +199,115 @@ def validate_saved_script(script_id: int):
     script = _fetch_script(script_id)
     result = validate_content(script["content"])
     return result
+
+
+# ---- multilingual translations --------------------------------------------
+
+@app.put("/api/scripts/{script_id}/language")
+def set_script_language(script_id: int, payload: LanguageIn):
+    """Set (or replace) the script's single target language.
+
+    Changing the language CODE switches the target: previous translations
+    belong to the old language and are removed so they can never be shown or
+    frozen into a share under the wrong language. Renaming only the display
+    label keeps the translations. Setting the same code just updates the label.
+    """
+    script = _fetch_script(script_id)
+    code = payload.lang_code.strip()
+    label = payload.lang_label.strip()
+    if not code or not label:
+        raise HTTPException(400, "语言代码与语言名称均不能为空")
+    ts = now_iso()
+    with get_db() as db:
+        if script["lang_code"] and code != script["lang_code"]:
+            db.execute(
+                "DELETE FROM translations WHERE script_id = ? AND lang_code = ?",
+                (script_id, script["lang_code"]),
+            )
+        db.execute(
+            "UPDATE scripts SET lang_code = ?, lang_label = ?, updated_at = ? WHERE id = ?",
+            (code, label, ts, script_id),
+        )
+    return {"id": script_id, "lang_code": code, "lang_label": label, "updated_at": ts}
+
+
+@app.get("/api/scripts/{script_id}/translations")
+def list_translations(script_id: int):
+    """Editor view of every translatable field and its translation state.
+
+    Returns the target language plus per-field rows (source text, translation,
+    status missing/pending/reviewed) and summary counts. Status is derived
+    from the current saved content, so it is correct right after a save.
+    """
+    script = _fetch_script(script_id)
+    with get_db() as db:
+        return translation_view(db, script_id, script["content"], script["lang_code"])
+
+
+@app.put("/api/scripts/{script_id}/translations")
+def upsert_translation(script_id: int, payload: TranslationIn):
+    """Save one field translation and mark it reviewed against current source.
+
+    The row is pinned to (node_id, field[, option_id]); if that node/option
+    has since been deleted the request is rejected (404) rather than storing
+    a dangling translation. An empty translation deletes the row (field
+    becomes 缺失/missing again).
+    """
+    script = _fetch_script(script_id)
+    code = script["lang_code"]
+    if not code:
+        raise HTTPException(400, "请先为脚本设置目标语言，再维护译文")
+    if payload.field not in VALID_FIELDS:
+        raise HTTPException(400, f"不支持的译文字段：{payload.field}")
+    option_id = payload.option_id or None
+    if payload.field == "option_label" and not option_id:
+        raise HTTPException(400, "选项译文必须提供 option_id")
+    if payload.field in ("title", "text") and option_id is not None:
+        raise HTTPException(400, "节点标题/正文译文不接受 option_id")
+    source = get_field_source(script["content"], payload.node_id, payload.field, option_id)
+    if source is None:
+        raise HTTPException(404, "对应节点或选项已删除，译文不会套用到新对象上")
+
+    ts = now_iso()
+    text = payload.translation
+    with get_db() as db:
+        if not text.strip():
+            if option_id is not None:
+                db.execute(
+                    "DELETE FROM translations WHERE script_id = ? AND lang_code = ? "
+                    "AND node_id = ? AND field = ? AND option_id = ?",
+                    (script_id, code, payload.node_id, payload.field, option_id),
+                )
+            else:
+                db.execute(
+                    "DELETE FROM translations WHERE script_id = ? AND lang_code = ? "
+                    "AND node_id = ? AND field = ? AND option_id IS NULL",
+                    (script_id, code, payload.node_id, payload.field),
+                )
+        else:
+            source_hash = hash_source(source)
+            # Upsert through the matching partial unique index: delete the
+            # previous row (if any) then insert, in this one transaction.
+            if option_id is not None:
+                db.execute(
+                    "DELETE FROM translations WHERE script_id = ? AND lang_code = ? "
+                    "AND node_id = ? AND field = ? AND option_id = ?",
+                    (script_id, code, payload.node_id, payload.field, option_id),
+                )
+            else:
+                db.execute(
+                    "DELETE FROM translations WHERE script_id = ? AND lang_code = ? "
+                    "AND node_id = ? AND field = ? AND option_id IS NULL",
+                    (script_id, code, payload.node_id, payload.field),
+                )
+            db.execute(
+                "INSERT INTO translations (script_id, lang_code, node_id, field, option_id, "
+                "translation, source_hash, status, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'reviewed', ?)",
+                (script_id, code, payload.node_id, payload.field, option_id,
+                 text, source_hash, ts),
+            )
+        return translation_view(db, script_id, script["content"], code)
 
 
 # ---- branch coverage ------------------------------------------------------
@@ -410,18 +552,33 @@ def import_script(payload: dict[str, Any]):
 # ---- read-only sharing ----------------------------------------------------
 
 @app.post("/api/scripts/{script_id}/share")
-def create_share(script_id: int):
+def create_share(script_id: int, payload: ShareCreate | None = None):
     script = _fetch_script(script_id)
+    lang_code = (payload.lang_code.strip() if payload and payload.lang_code else None)
+    frozen: dict[str, Any] = {"nodes": {}}
+    lang_label = None
+    if lang_code:
+        if not script["lang_code"]:
+            raise HTTPException(400, "该脚本尚未设置目标语言，无法创建带译文的分享")
+        if lang_code != script["lang_code"]:
+            raise HTTPException(400, "选择的语言与脚本目标语言不一致")
+        with get_db() as db:
+            frozen = freeze_translations(db, script_id, script["content"], lang_code)
+        lang_label = script["lang_label"]
     token = secrets.token_urlsafe(8)
     ts = now_iso()
     with get_db() as db:
         db.execute(
-            "INSERT INTO shares (token, script_id, script_name, content, invite_only, created_at) "
-            "VALUES (?, ?, ?, ?, 0, ?)",
+            "INSERT INTO shares (token, script_id, script_name, content, invite_only, "
+            "lang_code, lang_label, translations, created_at) "
+            "VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?)",
             (token, script_id, script["name"],
-             json.dumps(script["content"], ensure_ascii=False), ts),
+             json.dumps(script["content"], ensure_ascii=False),
+             lang_code, lang_label,
+             json.dumps(frozen, ensure_ascii=False), ts),
         )
-    return {"token": token, "url": f"/share.html?token={token}", "invite_only": False}
+    return {"token": token, "url": f"/share.html?token={token}", "invite_only": False,
+            "lang_code": lang_code, "lang_label": lang_label}
 
 
 @app.get("/api/share/{token}")
@@ -433,6 +590,10 @@ def get_share(token: str):
     return {"token": row["token"], "name": row["script_name"],
             "content": json.loads(row["content"]), "created_at": row["created_at"],
             "invite_only": bool(row["invite_only"]),
+            "lang_code": row["lang_code"], "lang_label": row["lang_label"],
+            # Frozen reviewed translations at snapshot time; mapping:
+            # translations.nodes[node_id].title/.text/.options[option_id].
+            "translations": json.loads(row["translations"] or "{}"),
             "read_only": True}
 
 

@@ -18,6 +18,12 @@ const state = {
   history: { stack: [], index: -1, mergeKey: null, mergeAt: 0 },
   savedSnapshot: null,        // JSON of {name, content} at last save / open
   coverage: null,             // branch coverage stats for the saved script, null = unknown
+  i18n: {
+    langCode: null,           // configured target language for the current script
+    langLabel: "",
+    view: null,               // GET translations response: {fields, counts}
+    filter: "all",            // all | missing | pending | reviewed
+  },
 };
 
 const HISTORY_LIMIT = 100;
@@ -841,6 +847,10 @@ function renderInspector() {
     state.selectedNodeId = null;
     changed();
   };
+
+  // Multilingual status mini-badges (title / text / each option) when a
+  // target language is configured.
+  annotateInspectorI18n();
 }
 
 // ---------------------------------------------------------------- history (undo / redo)
@@ -889,6 +899,7 @@ function pushHistory(mergeKey = null) {
 function syncDirty() {
   state.dirty = !!state.doc && docSnapshot() !== state.savedSnapshot;
   renderStatus();
+  updateI18nBadge();
 }
 
 function applyHistory(step) {
@@ -936,6 +947,7 @@ function commitTyped(mergeKey) {
   pushHistory(mergeKey);
   clearTimeout(validateTimer);
   validateTimer = setTimeout(validateLocal, 150);
+  annotateInspectorI18n();   // original edits flip translations to 待复核 live
 }
 
 // ---------------------------------------------------------------- persistence
@@ -949,7 +961,11 @@ async function loadList(selectId) {
     state.doc = null;
     state.dirty = false;
     state.coverage = null;
+    state.i18n.langCode = null;
+    state.i18n.langLabel = "";
+    state.i18n.view = null;
     state.markers = { cycles: [], orphans: [], uncovered: [], errors: [] };
+    updateI18nBadge();
     resetHistory();
     renderStatus();
   }
@@ -958,13 +974,15 @@ async function loadList(selectId) {
 async function openScript(id) {
   const s = await api(`/api/scripts/${id}`);
   state.currentId = id;
-  state.doc = { name: s.name, content: s.content };
+  state.doc = { name: s.name, content: s.content,
+                lang_code: s.lang_code || null, lang_label: s.lang_label || "" };
   state.selectedNodeId = null;
   state.selectedEdge = null;
   state.dirty = false;
   $("#scriptName").value = s.name;
   state.pan = { x: 60, y: 40 };
   await loadCoverage();
+  await loadI18n(id);
   validateLocal();
   renderAll();
   resetHistory();
@@ -1007,6 +1025,7 @@ async function saveScript() {
   if (fresh) { state.markers = fresh; }
   state.scripts = await api("/api/scripts");
   await loadCoverage();
+  await loadI18n(state.currentId);   // server reconciled pending/missing on save
   validateLocal();
   renderAll();
   // saved: unsaved marker clears and undo/redo history restarts from this point
@@ -1026,7 +1045,16 @@ function bindToolbar() {
   $("#impactRefresh").onclick = runImpact;
   $("#btnRoute").onclick = openRoute;
   $("#routeRun").onclick = runRoutePlan;
+  $("#btnI18n").onclick = openI18n;
+  $("#i18nSaveLang").onclick = saveI18nLanguage;
+  $("#i18nFilters").addEventListener("click", (e) => {
+    const b = e.target.closest(".i18n-filter");
+    if (!b) return;
+    state.i18n.filter = b.dataset.filter;
+    renderI18nModal();
+  });
   $("#btnShare").onclick = openShare;
+  $("#shareCreate").onclick = createShareSnapshot;
   $("#inviteGen").onclick = generateInvites;
   $("#inviteRefresh").onclick = loadInvites;
   $("#btnExport").onclick = exportJson;
@@ -1317,6 +1345,290 @@ async function confirmPort() {
     portSubgraphSummary(order).internal} 条内部连接`);
 }
 
+// ---------------------------------------------------------------- multilingual translations
+// One target language per script; translations are keyed by node/option ids.
+// The server is the source of truth: it flips rows to 待复核 (pending) when the
+// original field changes and deletes rows of deleted nodes/options on save.
+// The editor view below additionally recomputes status LIVE against the
+// current (possibly unsaved) canvas, so editing a title immediately marks its
+// translation pending without a round trip.
+
+const i18nFieldName = { title: "标题", text: "正文", option_label: "选项文案" };
+const i18nStatusMeta = {
+  reviewed: { label: "已复核", cls: "reviewed" },
+  pending: { label: "待复核", cls: "pending" },
+  missing: { label: "缺失", cls: "missing" },
+};
+
+async function loadI18n(scriptId) {
+  try {
+    const v = await api(`/api/scripts/${scriptId}/translations`);
+    state.i18n.langCode = v.lang_code || null;
+    state.i18n.view = v;
+  } catch (err) {
+    state.i18n.langCode = null;
+    state.i18n.view = null;
+  }
+  state.doc && (state.doc.lang_code = state.i18n.langCode);
+  updateI18nBadge();
+  annotateInspectorI18n();
+  return state.i18n.view;
+}
+
+// Server status reflects the last save (f.status + f.source = saved current
+// text); recompute against the live canvas so unsaved original edits flip a
+// reviewed field to pending right away. A field already pending stays pending;
+// when the canvas matches the saved source, the server status is authoritative.
+function liveFieldStatus(f) {
+  if (!f.translation) return "missing";
+  const node = getNode(f.node_id);
+  if (!node) return f.status;   // deleted locally: row disappears after save
+  let source = null;
+  if (f.field === "option_label") {
+    const o = (node.options || []).find((x) => x.id === f.option_id);
+    source = o ? (o.label || "") : null;
+  } else source = node[f.field] || "";
+  if (source === null) return f.status;
+  if (source !== f.source) return "pending";  // unsaved local original edit
+  return f.status;
+}
+
+function i18nLiveCounts() {
+  const counts = { total: 0, reviewed: 0, pending: 0, missing: 0 };
+  const view = state.i18n.view;
+  if (!view) return counts;
+  view.fields.forEach((f) => {
+    const node = getNode(f.node_id);
+    if (!node) return;  // deleted locally: row disappears on save
+    if (f.field === "option_label" && !(node.options || []).some((o) => o.id === f.option_id)) return;
+    counts.total += 1;
+    counts[liveFieldStatus(f)] += 1;
+  });
+  return counts;
+}
+
+function updateI18nBadge() {
+  const badge = $("#i18nBadge");
+  if (!badge) return;
+  if (!state.i18n.langCode || !state.i18n.view) { badge.style.display = "none"; return; }
+  const c = i18nLiveCounts();   // live canvas view; equals server counts when saved
+  if (!c.pending && !c.missing) { badge.style.display = "none"; return; }
+  badge.style.display = "";
+  badge.textContent = `缺 ${c.missing} · 待复核 ${c.pending}`;
+  badge.title = `译文缺失 ${c.missing} 个字段，待复核 ${c.pending} 个字段（点击打开多语言译文面板定位）`;
+}
+
+async function openI18n() {
+  if (!state.currentId || !state.doc) return;
+  if (state.dirty) {
+    await saveScript();   // status is always judged against saved content
+    if (!state.currentId) return;
+  }
+  await loadI18n(state.currentId);
+  state.i18n.filter = "all";
+  $("#i18nCode").value = state.i18n.langCode || "";
+  $("#i18nLabel").value = state.doc.lang_label || "";
+  openModal("i18nModal");
+  renderI18nModal();
+}
+
+function renderI18nLangHeader() {
+  const hint = $("#i18nLangHint");
+  const code = state.i18n.langCode;
+  if (code) {
+    hint.innerHTML = `当前目标语言：<b>${esc(state.doc.lang_label || code)}</b>
+      <code class="i18n-lang-code">${esc(code)}</code>
+      <span class="i18n-hint-note">（更换语言代码会清空该脚本已有的全部译文；仅改名称则保留）</span>`;
+  } else {
+    hint.innerHTML = `<span class="i18n-hint-note">尚未设置目标语言：填入语言代码与名称并点击「保存语言」后即可逐字段维护译文。</span>`;
+  }
+  $("#i18nSummary").style.display = code ? "" : "none";
+  $("#i18nList").style.display = code ? "" : "none";
+}
+
+function renderI18nModal() {
+  renderI18nLangHeader();
+  const code = state.i18n.langCode;
+  if (!code || !state.i18n.view) { $("#i18nList").innerHTML = ""; return; }
+
+  const live = new Map();
+  state.i18n.view.fields.forEach((f) => live.set(f, liveFieldStatus(f)));
+  const counts = { total: 0, reviewed: 0, pending: 0, missing: 0 };
+  live.forEach((st) => { counts.total += 1; counts[st] += 1; });
+  $("#i18nTotal").textContent = counts.total;
+  $("#i18nReviewed").textContent = counts.reviewed;
+  $("#i18nPending").textContent = counts.pending;
+  $("#i18nMissing").textContent = counts.missing;
+  $("#i18nFilters").querySelectorAll(".i18n-filter").forEach((b) => {
+    b.classList.toggle("active", b.dataset.filter === state.i18n.filter);
+    const base = b.dataset.filter === "all" ? "全部"
+      : (b.dataset.filter === "missing" ? "仅缺失"
+        : b.dataset.filter === "pending" ? "仅待复核" : "仅已复核");
+    b.textContent = b.dataset.filter === "all" ? base : `${base}（${counts[b.dataset.filter]}）`;
+  });
+
+  // Group fields by node in canvas order.
+  const groups = state.doc.content.nodes.map((node) => ({
+    node,
+    rows: state.i18n.view.fields
+      .filter((f) => f.node_id === node.id)
+      .filter((f) => {
+        if (f.field === "option_label") {
+          return (node.options || []).some((o) => o.id === f.option_id);
+        }
+        return true;
+      })
+      .filter((f) => state.i18n.filter === "all" || live.get(f) === state.i18n.filter),
+  })).filter((g) => g.rows.length);
+
+  const list = $("#i18nList");
+  if (!groups.length) {
+    list.innerHTML = `<div class="cov-empty">当前筛选条件下没有字段。</div>`;
+    return;
+  }
+  list.innerHTML = groups.map((g) => `
+    <div class="i18n-group">
+      <div class="i18n-group-head">
+        ${esc(g.node.title || "(未命名节点)")}
+        <code class="i18n-node-id">${esc(g.node.id)}</code>
+        ${g.node.id === state.doc.content.start_node_id ? '<span class="route-tag">起始</span>' : ""}
+        ${g.node.terminal ? '<span class="route-tag end">终点</span>' : ""}
+      </div>
+      ${g.rows.map((f) => {
+        const st = live.get(f);
+        const meta = i18nStatusMeta[st];
+        const optId = f.option_id ? f.option_id : "";
+        return `
+        <div class="i18n-row ${meta.cls}" data-node="${esc(f.node_id)}" data-field="${esc(f.field)}"
+             data-opt="${esc(optId)}" data-saved="${esc(f.translation)}">
+          <div class="i18n-row-head">
+            <span class="i18n-field-name">${i18nFieldName[f.field] || f.field}
+              ${f.option_id ? `<code>${esc(f.option_id)}</code>` : ""}</span>
+            <span class="i18n-status ${meta.cls}">${meta.label}</span>
+            <button class="i18n-locate" data-locate-node="${esc(f.node_id)}"
+                    ${f.option_id ? `data-locate-opt="${esc(f.option_id)}"` : ""}
+                    data-locate-field="${esc(f.field)}">🎯 定位字段</button>
+          </div>
+          <div class="i18n-source" title="脚本原文（只读）">${esc(f.source || "（空）")}</div>
+          <textarea class="i18n-input" rows="2"
+                    placeholder="输入${esc(state.doc.lang_label || "目标语言")}译文（留空保存即删除该译文）">${esc(f.translation)}</textarea>
+          ${st === "pending" ? '<div class="i18n-pending-note">⚠ 原文已改动：核对译文后在此失焦即自动保存为已复核；不再需要时清空即可。</div>' : ""}
+        </div>`;
+      }).join("")}
+    </div>`).join("");
+
+  list.querySelectorAll(".i18n-input").forEach((ta) => {
+    ta.addEventListener("blur", (e) => saveI18nField(e.target));
+    ta.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); e.target.blur(); }
+    });
+  });
+  list.querySelectorAll("[data-locate-node]").forEach((b) => {
+    b.onclick = () => {
+      closeModal("i18nModal");
+      locateI18nField(b.dataset.locateNode, b.dataset.locateOpt || null, b.dataset.locateField);
+    };
+  });
+}
+
+async function saveI18nLanguage() {
+  if (!state.currentId) return;
+  const code = $("#i18nCode").value.trim();
+  const label = $("#i18nLabel").value.trim();
+  if (!code || !label) { toast("请填写语言代码与语言名称"); return; }
+  const existing = state.i18n.view?.counts;
+  if (state.i18n.langCode && code !== state.i18n.langCode && existing &&
+      existing.reviewed + existing.pending > 0 &&
+      !confirm(`更换目标语言为「${code}」将清空当前语言的全部译文，确认？`)) return;
+  const btn = $("#i18nSaveLang");
+  btn.disabled = true;
+  try {
+    const r = await api(`/api/scripts/${state.currentId}/language`,
+      { method: "PUT", body: { lang_code: code, lang_label: label } });
+    state.i18n.langCode = r.lang_code;
+    state.doc.lang_code = r.lang_code;
+    state.doc.lang_label = r.lang_label;
+    await loadI18n(state.currentId);
+    renderI18nModal();
+    toast(`目标语言已保存：${r.lang_label}（${r.lang_code}）`);
+  } catch (err) {
+    toast("保存语言失败：" + err.message, 3500);
+  }
+  btn.disabled = false;
+}
+
+async function saveI18nField(ta) {
+  const row = ta.closest(".i18n-row");
+  if (!row || !state.currentId || !state.i18n.langCode) return;
+  if (ta.value === row.dataset.saved) return;  // unchanged
+  const body = {
+    node_id: row.dataset.node,
+    field: row.dataset.field,
+    option_id: row.dataset.opt || null,
+    translation: ta.value,
+  };
+  ta.disabled = true;
+  try {
+    const v = await api(`/api/scripts/${state.currentId}/translations`, { method: "PUT", body });
+    state.i18n.view = v;
+    renderI18nModal();
+    updateI18nBadge();
+    annotateInspectorI18n();
+  } catch (err) {
+    ta.disabled = false;
+    toast("译文保存失败：" + err.message, 3500);
+  }
+}
+
+// Close the modal, select the node and briefly highlight the matching
+// inspector field (title / text input / option label input).
+function locateI18nField(nodeId, optionId, field) {
+  const node = getNode(nodeId);
+  if (!node) { toast("该节点已不在当前画布上，无法定位"); return; }
+  state.selectedNodeId = nodeId;
+  state.selectedEdge = null;
+  drawNodes(); drawEdges(); renderInspector();
+  requestAnimationFrame(() => {
+    let target = null;
+    if (optionId) {
+      target = document.querySelector(`.opt-edit[data-oid="${CSS.escape(optionId)}"] .opt-label-in`);
+    } else if (field === "title") target = $("#fTitle");
+    else if (field === "text") target = $("#fText");
+    if (target) {
+      target.focus();
+      target.classList.add("i18n-flash");
+      target.scrollIntoView({ block: "center", behavior: "smooth" });
+      setTimeout(() => target.classList.remove("i18n-flash"), 1600);
+    }
+  });
+}
+
+// Small status markers next to inspector fields (only when a language is set).
+function annotateInspectorI18n() {
+  document.querySelectorAll(".i18n-mini").forEach((e) => e.remove());
+  if (!state.i18n.langCode || !state.i18n.view || !state.selectedNodeId) return;
+  const nodeId = state.selectedNodeId;
+  const mark = (el, status) => {
+    if (!el) return;
+    const meta = i18nStatusMeta[status];
+    const span = document.createElement("span");
+    span.className = `i18n-mini ${meta.cls}`;
+    span.textContent = `🌐 ${meta.label}`;
+    span.title = "目标语言译文状态（多语言译文面板可编辑）";
+    el.appendChild(span);
+  };
+  const find = (field, optionId) =>
+    state.i18n.view.fields.find((f) => f.node_id === nodeId && f.field === field &&
+      ((f.option_id || null) === (optionId || null)));
+  const fTitle = find("title"), fText = find("text");
+  if (fTitle) mark($("#fTitle")?.closest(".field"), liveFieldStatus(fTitle));
+  if (fText) mark($("#fText")?.closest(".field"), liveFieldStatus(fText));
+  document.querySelectorAll(".opt-edit").forEach((row) => {
+    const f = find("option_label", row.dataset.oid);
+    if (f) mark(row.querySelector(".row"), liveFieldStatus(f));
+  });
+}
+
 // ---------------------------------------------------------------- share / preview
 
 const shareState = { token: null, url: "" };
@@ -1324,16 +1636,57 @@ const shareState = { token: null, url: "" };
 async function openShare() {
   if (!state.currentId) return;
   if (state.dirty) await saveScript();
-  const r = await api(`/api/scripts/${state.currentId}/share`, { method: "POST" });
-  shareState.token = r.token;
-  shareState.url = location.origin + r.url;
-  $("#shareLink").value = shareState.url;
-  $("#shareOpen").onclick = () => window.open(shareState.url, "_blank");
-  $("#shareCopy").onclick = () => {
-    copyText(shareState.url).then((ok) => toast(ok ? "链接已复制" : "复制失败，请手动选择复制"));
-  };
+  await loadI18n(state.currentId);
+
+  // Language options: original text (default) or the script's target language.
+  const sel = $("#shareLang");
+  if (state.i18n.langCode) {
+    sel.innerHTML =
+      `<option value="">原文（不附带译文）</option>
+       <option value="${esc(state.i18n.langCode)}">${esc(state.doc.lang_label || state.i18n.langCode)}（${esc(state.i18n.langCode)}）— 冻结已复核译文</option>`;
+    const c = state.i18n.view?.counts;
+    sel.value = c && c.reviewed > 0 ? state.i18n.langCode : "";
+  } else {
+    sel.innerHTML = `<option value="">原文（脚本尚未设置目标语言）</option>`;
+  }
+  $("#shareResult").style.display = "none";
+  $("#shareLangNote").innerHTML = "";
   openModal("shareModal");
-  loadInvites();
+}
+
+async function createShareSnapshot() {
+  if (!state.currentId) return;
+  const langCode = $("#shareLang").value || null;
+  const btn = $("#shareCreate");
+  btn.disabled = true;
+  try {
+    const r = await api(`/api/scripts/${state.currentId}/share`, {
+      method: "POST",
+      body: langCode ? { lang_code: langCode } : {},
+    });
+    shareState.token = r.token;
+    shareState.url = location.origin + r.url;
+    $("#shareLink").value = shareState.url;
+    $("#shareResult").style.display = "";
+    const note = $("#shareLangNote");
+    if (r.lang_code) {
+      const c = state.i18n.view?.counts || { reviewed: 0, pending: 0, missing: 0 };
+      note.innerHTML = `🌐 该快照已冻结 <b>${esc(r.lang_label || r.lang_code)}</b> 语言下
+        生成时刻的<b>已复核译文（${c.reviewed} 个字段）</b>；作答页逐字段展示译文，
+        <b>待复核（${c.pending}）/ 缺失（${c.missing}）字段回退原文</b>。译文已随快照固定，
+        之后继续翻译或修改原文都不影响此链接。`;
+    } else {
+      note.innerHTML = `该快照为<b>纯原文</b>，作答页展示脚本原文。`;
+    }
+    $("#shareOpen").onclick = () => window.open(shareState.url, "_blank");
+    $("#shareCopy").onclick = () => {
+      copyText(shareState.url).then((ok) => toast(ok ? "链接已复制" : "复制失败，请手动选择复制"));
+    };
+    loadInvites();
+  } catch (err) {
+    toast("创建分享失败：" + err.message, 3500);
+  }
+  btn.disabled = false;
 }
 
 async function loadInvites() {

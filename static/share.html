@@ -10,6 +10,7 @@
 <div class="readonly-banner">
   🔒 只读分享 · 访谈脚本：<b id="shareName" style="margin:0 6px"></b>
   <span id="inviteBadge" class="invite-chip" style="display:none">🎫 邀请制</span>
+  <span id="langBadge" class="lang-chip" style="display:none"></span>
   <span style="margin-left:auto">此页面为只读快照，无法编辑脚本</span>
 </div>
 <div style="max-width:860px;margin:24px auto;padding:0 16px">
@@ -101,6 +102,11 @@
 <script>
   let runId = null;
   let inviteOnly = false;
+  // Frozen at share-creation time: translations.nodes[node_id].title/.text/.options[option_id].
+  // Only fields that were 已复核 (reviewed) at that moment are present; everything
+  // else falls back to the original script text, field by field.
+  let shareLang = null;      // {code, label} or null for a plain-original snapshot
+  let shareTrans = null;     // frozen translation map
   const shareToken = new URLSearchParams(location.search).get("token");
   const prefilledResume = (new URLSearchParams(location.search).get("resume") || "").trim();
   const prefilledInvite = (new URLSearchParams(location.search).get("invite") || "").trim();
@@ -109,6 +115,24 @@
 
   function showGate() { $("gate").style.display = ""; $("session").style.display = "none"; }
   function showSession() { $("gate").style.display = "none"; $("session").style.display = ""; }
+
+  // Per-field display text: frozen reviewed translation when available,
+  // otherwise the original text from the snapshot (missing / 待复核 fields).
+  function trField(nodeId, field, original) {
+    const v = shareTrans?.nodes?.[nodeId]?.[field];
+    return (typeof v === "string" && v) ? v : original;
+  }
+  function trOption(nodeId, optionId, original) {
+    const v = shareTrans?.nodes?.[nodeId]?.options?.[optionId];
+    return (typeof v === "string" && v) ? v : original;
+  }
+  // Escaped display string + a title tooltip carrying the original text when
+  // the respondent is seeing a translation.
+  function trHtml(nodeId, field, original) {
+    const t = trField(nodeId, field, original);
+    const tip = (t !== original && shareLang) ? ` title="原文：${esc(original)}"` : "";
+    return `<span${tip}>${esc(t)}</span>`;
+  }
 
   function showResumeError(msg) {
     const el = $("resumeError");
@@ -141,20 +165,23 @@
     if (finished) {
       card.innerHTML = `
         <div class="q-card">
-          <div class="q-title">${esc(node.title)}</div>
-          <div class="q-text">${esc(node.text)}</div>
+          <div class="q-title">${trHtml(node.id, "title", node.title)}</div>
+          <div class="q-text">${trHtml(node.id, "text", node.text)}</div>
           <div class="end">— 访谈结束 —</div>
         </div>`;
     } else {
       card.innerHTML = `
         <div class="q-card">
-          <div class="q-title">${esc(node.title)}</div>
-          <div class="q-text">${esc(node.text)}</div>
+          <div class="q-title">${trHtml(node.id, "title", node.title)}</div>
+          <div class="q-text">${trHtml(node.id, "text", node.text)}</div>
           <div class="choices">
-            ${node.options.map((o) =>
-              `<button data-oid="${o.id}" ${o.target_id ? "" : "disabled"}>
-                 ${esc(o.label)}${o.target_id ? "" : "（未连接）"}
-               </button>`).join("")}
+            ${node.options.map((o) => {
+              const label = trOption(node.id, o.id, o.label);
+              const tip = (label !== o.label && shareLang) ? ` title="原文：${esc(o.label)}"` : "";
+              return `<button data-oid="${o.id}" ${o.target_id ? "" : "disabled"}${tip}>
+                 ${esc(label)}${o.target_id ? "" : "（未连接）"}
+               </button>`;
+            }).join("")}
           </div>
         </div>`;
       card.querySelectorAll("button[data-oid]").forEach((b) => {
@@ -313,6 +340,16 @@
       $("shareName").textContent = share.name;
       inviteOnly = !!share.invite_only;
       $("inviteBadge").style.display = inviteOnly ? "" : "none";
+      // Frozen translations (reviewed at snapshot time). The snapshot content
+      // itself is never translated server-side: option ids, jumps and the
+      // recorded answer path all stay on the original script.
+      if (share.lang_code) {
+        shareLang = { code: share.lang_code, label: share.lang_label || share.lang_code };
+        shareTrans = share.translations || null;
+        $("langBadge").textContent = `🌐 ${shareLang.label}`;
+        $("langBadge").title = "该快照附带此语言下生成时刻已复核的译文；缺失或待复核字段显示原文";
+        $("langBadge").style.display = "";
+      }
       renderGate();
       showGate();
       if (inviteOnly && prefilledInvite) {

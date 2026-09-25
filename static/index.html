@@ -32,6 +32,7 @@
       <button id="btnCoverage" title="按已保存运行记录统计各选项被选择次数">📊 分支覆盖</button>
       <button id="btnImpact" title="以当前画布（含未保存修改）重放核对全部预览与分享作答，找出受改稿影响的会话">🩺 改稿影响分析</button>
       <button id="btnRoute" title="勾选 1～6 个已连接选项，规划经过它们到达终点的最短选择序列">🧭 路线规划</button>
+      <button id="btnI18n" title="为脚本维护目标语言译文：按节点/选项 ID 编辑标题、正文与选项译文，原文改动后译文标为待复核">🌐 多语言译文<span id="i18nBadge" class="i18n-badge" style="display:none"></span></button>
       <button id="btnShare">🔗 只读分享</button>
       <button id="btnExport">导出 JSON</button>
       <button id="btnImport">导入 JSON</button>
@@ -172,6 +173,58 @@
   </div>
 </div>
 
+<!-- multilingual translation modal -->
+<div class="modal-mask" id="i18nModal">
+  <div class="modal wide">
+    <header>🌐 多语言译文<span class="close" data-close="i18nModal">✕</span></header>
+    <div class="body">
+      <p class="route-tip">
+        为脚本维护<b>一个目标语言</b>，按<b>节点/选项 ID</b> 编辑标题、正文与选项文案的译文。
+        保存脚本后，若原文字段发生改动，对应译文自动标为<b>待复核</b>，需重新核对保存；
+        删除节点或选项后其译文立即删除，<b>不会套到新对象</b>。创建只读分享时可选择该语言，
+        分享快照只冻结当时<b>已复核</b>的译文，作答页缺失或待复核字段自动回退原文，
+        选项 ID、跳转与作答记录始终沿用原脚本。
+      </p>
+
+      <!-- target language config -->
+      <div class="i18n-lang-row">
+        <div class="field" style="flex:0 0 150px;margin:0">
+          <label for="i18nCode">目标语言代码（BCP-47，如 en / ja / zh-TW）</label>
+          <input id="i18nCode" type="text" placeholder="en" spellcheck="false">
+        </div>
+        <div class="field" style="flex:1;margin:0">
+          <label for="i18nLabel">语言名称（如 English / 日本語）</label>
+          <input id="i18nLabel" type="text" placeholder="English">
+        </div>
+        <button class="primary" id="i18nSaveLang" style="align-self:flex-end">保存语言</button>
+      </div>
+      <div id="i18nLangHint" class="i18n-lang-hint"></div>
+
+      <!-- counts + filters -->
+      <div id="i18nSummary" class="i18n-summary" style="display:none">
+        <div class="cov-cards">
+          <div><b id="i18nTotal">0</b><span>可译字段</span></div>
+          <div><b id="i18nReviewed" style="color:var(--start)">0</b><span>已复核</span></div>
+          <div><b id="i18nPending" style="color:var(--orphan)">0</b><span>待复核</span></div>
+          <div><b id="i18nMissing" style="color:var(--coverage-miss)">0</b><span>缺失</span></div>
+        </div>
+        <div class="i18n-filters" id="i18nFilters">
+          <button class="i18n-filter active" data-filter="all">全部</button>
+          <button class="i18n-filter" data-filter="missing">仅缺失</button>
+          <button class="i18n-filter" data-filter="pending">仅待复核</button>
+          <button class="i18n-filter" data-filter="reviewed">仅已复核</button>
+        </div>
+      </div>
+
+      <!-- fields, grouped by node -->
+      <div id="i18nList" class="i18n-list"></div>
+    </div>
+    <footer>
+      <button data-close="i18nModal">关闭</button>
+    </footer>
+  </div>
+</div>
+
 <!-- share modal -->
 <div class="modal-mask" id="shareModal">
   <div class="modal">
@@ -179,28 +232,38 @@
     <div class="body">
       <p style="margin:0 0 12px;color:var(--muted);font-size:13px">
         链接打开的是生成分享时脚本的只读快照（受访者视角），后续编辑不影响已分享内容。</p>
-      <div class="share-link-row">
-        <input id="shareLink" readonly>
-        <button id="shareCopy">复制</button>
-      </div>
-      <div style="margin-top:12px"><button class="primary" id="shareOpen">在新标签页打开</button></div>
 
-      <div class="invite-box">
-        <h4>🎫 邀请码（邀请制）</h4>
-        <p style="margin:0 0 10px;font-size:13px;color:var(--muted);line-height:1.7">
+      <div class="field">
+        <label for="shareLang">快照语言（逐字段展示该语言下当时已复核的译文，缺失/待复核字段回退原文）</label>
+        <select id="shareLang"></select>
+      </div>
+      <div style="margin:0 0 12px"><button class="primary" id="shareCreate">🔗 生成分享快照</button></div>
+
+      <div id="shareResult" style="display:none">
+        <div class="share-link-row">
+          <input id="shareLink" readonly>
+          <button id="shareCopy">复制</button>
+        </div>
+        <div style="margin:10px 0 0" id="shareLangNote" class="i18n-lang-hint"></div>
+        <div style="margin-top:12px"><button class="primary" id="shareOpen">在新标签页打开</button></div>
+
+        <div class="invite-box">
+          <h4>🎫 邀请码（邀请制）</h4>
+          <p style="margin:0 0 10px;font-size:13px;color:var(--muted);line-height:1.7">
           为<b>当前这个分享快照</b>开启邀请制后，受访者必须在分享页输入邀请码才能开始新的作答；
           邀请码只属于该快照、一码仅可使用一次（核验、消耗与新建会话在同一数据库写事务中完成，
           重复 / 跨快照 / 并发使用均被拒绝且不会新增会话）。公开链接、编辑器预览与凭续答令牌恢复均不受影响。</p>
-        <div class="invite-gen-row">
-          <label>批量生成
-            <input id="inviteCount" type="number" min="1" max="500" value="10">
-          </label>
-          <span>个随机邀请码</span>
-          <button class="primary" id="inviteGen">开启邀请制并生成</button>
-          <button id="inviteRefresh">↻ 刷新</button>
+          <div class="invite-gen-row">
+            <label>批量生成
+              <input id="inviteCount" type="number" min="1" max="500" value="10">
+            </label>
+            <span>个随机邀请码</span>
+            <button class="primary" id="inviteGen">开启邀请制并生成</button>
+            <button id="inviteRefresh">↻ 刷新</button>
+          </div>
+          <div id="inviteStatus" class="invite-status"></div>
+          <div id="inviteCodes" class="invite-codes"></div>
         </div>
-        <div id="inviteStatus" class="invite-status"></div>
-        <div id="inviteCodes" class="invite-codes"></div>
       </div>
     </div>
     <footer><button data-close="shareModal">关闭</button></footer>
